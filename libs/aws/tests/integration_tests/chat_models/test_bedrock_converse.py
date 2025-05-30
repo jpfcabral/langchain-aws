@@ -1,11 +1,15 @@
 """Standard LangChain interface tests"""
 
+import base64
 from typing import Literal, Type
 
+import httpx
 import pytest
+from langchain_core.exceptions import OutputParserException
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage
-from langchain_standard_tests.integration_tests import ChatModelIntegrationTests
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.tools import BaseTool
+from langchain_tests.integration_tests import ChatModelIntegrationTests
 from pydantic import BaseModel, Field
 from typing_extensions import Annotated, TypedDict
 
@@ -43,9 +47,15 @@ class TestBedrockMistralStandard(ChatModelIntegrationTests):
     def standard_chat_model_params(self) -> dict:
         return {"temperature": 0, "max_tokens": 100, "stop": []}
 
+    @property
+    def has_tool_choice(self) -> bool:
+        return False
+
     @pytest.mark.xfail(reason="Human messages following AI messages not supported.")
-    def test_tool_message_histories_list_content(self, model: BaseChatModel) -> None:
-        super().test_tool_message_histories_list_content(model)
+    def test_tool_message_histories_list_content(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_tool_message_histories_list_content(model, my_adder_tool)
 
 
 class TestBedrockNovaStandard(ChatModelIntegrationTests):
@@ -61,17 +71,17 @@ class TestBedrockNovaStandard(ChatModelIntegrationTests):
     def standard_chat_model_params(self) -> dict:
         return {"max_tokens": 300, "stop": []}
 
-    @property
-    def tool_choice_value(self) -> str:
-        return "auto"
-
     @pytest.mark.xfail(reason="Tool choice 'Any' not supported.")
-    def test_structured_few_shot_examples(self, model: BaseChatModel) -> None:
-        super().test_structured_few_shot_examples(model)
+    def test_structured_few_shot_examples(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_structured_few_shot_examples(model, my_adder_tool)
 
     @pytest.mark.xfail(reason="Human messages following AI messages not supported.")
-    def test_tool_message_histories_list_content(self, model: BaseChatModel) -> None:
-        super().test_tool_message_histories_list_content(model)
+    def test_tool_message_histories_list_content(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_tool_message_histories_list_content(model, my_adder_tool)
 
 
 class TestBedrockCohereStandard(ChatModelIntegrationTests):
@@ -87,11 +97,17 @@ class TestBedrockCohereStandard(ChatModelIntegrationTests):
     def standard_chat_model_params(self) -> dict:
         return {"temperature": 0, "max_tokens": 100, "stop": []}
 
-    @pytest.mark.xfail(reason="Cohere models don't support tool_choice.")
-    def test_structured_few_shot_examples(self, model: BaseChatModel) -> None:
-        pass
+    @property
+    def has_tool_choice(self) -> bool:
+        return False
 
     @pytest.mark.xfail(reason="Cohere models don't support tool_choice.")
+    def test_structured_few_shot_examples(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        pass
+
+    @pytest.mark.xfail(reason="Generates invalid tool call.")
     def test_tool_calling_with_no_arguments(self, model: BaseChatModel) -> None:
         pass
 
@@ -109,8 +125,14 @@ class TestBedrockMetaStandard(ChatModelIntegrationTests):
     def standard_chat_model_params(self) -> dict:
         return {"temperature": 0.1, "max_tokens": 100, "stop": []}
 
+    @property
+    def has_tool_choice(self) -> bool:
+        return False
+
     @pytest.mark.xfail(reason="Meta models don't support tool_choice.")
-    def test_structured_few_shot_examples(self, model: BaseChatModel) -> None:
+    def test_structured_few_shot_examples(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
         pass
 
     # TODO: This needs investigation, if this is a bug with Bedrock or Llama models,
@@ -137,8 +159,18 @@ class TestBedrockMetaStandard(ChatModelIntegrationTests):
     @pytest.mark.xfail(
         reason="Human messages following AI messages not supported by Bedrock."
     )
-    def test_tool_message_histories_list_content(self, model: BaseChatModel) -> None:
-        super().test_tool_message_histories_list_content(model)
+    def test_tool_message_histories_list_content(
+        self, model: BaseChatModel, my_adder_tool: BaseTool
+    ) -> None:
+        super().test_tool_message_histories_list_content(model, my_adder_tool)
+
+
+class ClassifyQuery(BaseModel):
+    """Classify a query."""
+
+    query_type: Literal["cat", "dog"] = Field(
+        description="Classify a query as related to cats or dogs."
+    )
 
 
 def test_structured_output_snake_case() -> None:
@@ -146,16 +178,41 @@ def test_structured_output_snake_case() -> None:
         model="anthropic.claude-3-sonnet-20240229-v1:0", temperature=0
     )
 
-    class ClassifyQuery(BaseModel):
-        """Classify a query."""
-
-        query_type: Literal["cat", "dog"] = Field(
-            description="Classify a query as related to cats or dogs."
-        )
-
     chat = model.with_structured_output(ClassifyQuery)
     for chunk in chat.stream("How big are cats?"):
         assert isinstance(chunk, ClassifyQuery)
+
+
+def test_tool_calling_snake_case() -> None:
+    model = ChatBedrockConverse(model="anthropic.claude-3-sonnet-20240229-v1:0")
+
+    def classify_query(query_type: Literal["cat", "dog"]) -> None:
+        pass
+
+    chat = model.bind_tools([classify_query], tool_choice="any")
+    response = chat.invoke("How big are cats?")
+    assert isinstance(response, AIMessage)
+    assert len(response.tool_calls) == 1
+    tool_call = response.tool_calls[0]
+    assert tool_call["name"] == "classify_query"
+    assert tool_call["args"] == {"query_type": "cat"}
+
+    full = None
+    for chunk in chat.stream("How big are cats?"):
+        full = chunk if full is None else full + chunk  # type: ignore[assignment]
+    assert isinstance(full, AIMessageChunk)
+    assert len(full.tool_calls) == 1
+    tool_call = full.tool_calls[0]
+    assert tool_call["name"] == "classify_query"
+    assert tool_call["args"] == {"query_type": "cat"}
+
+    # Also test for response metadata, though this is not relevant to tool-calling
+    invoke_metadata = response.response_metadata
+    stream_metadata = full.response_metadata
+    for result in [invoke_metadata, stream_metadata]:
+        for expected_key in ["RequestId", "HTTPStatusCode", "HTTPHeaders"]:
+            assert result["ResponseMetadata"][expected_key]
+        assert isinstance(result["ResponseMetadata"]["RetryAttempts"], int)
 
 
 def test_structured_output_streaming() -> None:
@@ -194,6 +251,61 @@ def test_structured_output_streaming() -> None:
         chunk_count = chunk_count + 1
         assert isinstance(chunk, AnAnswerWithJustification)
     assert chunk_count > 1
+
+
+def test_tool_use_with_cache_point() -> None:
+    """Test toolUse with cachepoint to verify cache metrics are being reported.
+
+    This test creates tools with a length exceeding 1024 tokens to ensure
+    caching is triggered, and verifies the response metrics indicate cache
+    activity.
+    """
+    # Define a large number of tools to exceed 1024 tokens
+    tool_classes = []
+
+    # Each tool is simple but we'll define many of them
+    for i in range(1, 20):
+        # Creating a unique class for each tool
+        tool_class_name = f"CalculateTool{i}"
+
+        # Define the class using a closure to properly scope the fields
+        def create_tool_class(i: int) -> Type[BaseModel]:
+            class ToolClass(BaseModel):
+                number1: float = Field(description=f"First number for calculation {i}")
+                number2: float = Field(description=f"Second number for calculation {i}")
+                operation: Literal["add", "subtract", "multiply", "divide"] = Field(
+                    description=f"Operation {i} to perform on the numbers"
+                )
+
+            ToolClass.__doc__ = f"A tool to calculate the {i}th mathematical operation"
+            return ToolClass
+
+        tool_class = create_tool_class(i)
+        tool_class.__name__ = tool_class_name
+        tool_classes.append(tool_class)
+
+    # Create the model instance
+    model = ChatBedrockConverse(
+        model="us.anthropic.claude-3-7-sonnet-20250219-v1:0", temperature=0
+    )
+
+    # Create cache point configuration
+    cache_point = ChatBedrockConverse.create_cache_point()
+
+    # Bind tools with cache point
+    chat = model.bind_tools(tool_classes + [cache_point], tool_choice="any")
+
+    # Invocation
+    response = chat.invoke("What's 5 + 3?")
+    assert isinstance(response, AIMessage)
+    assert len(response.tool_calls) == 1
+
+    # Verify the response has cache metrics
+    assert response.usage_metadata is not None
+    input_token_details = response.usage_metadata["input_token_details"]
+    cache_read_input_tokens = input_token_details["cache_read"]
+    cache_write_input_tokens = input_token_details["cache_creation"]
+    assert cache_read_input_tokens + cache_write_input_tokens != 0
 
 
 @pytest.mark.skip(reason="Needs guardrails setup to run.")
@@ -242,3 +354,118 @@ def test_guardrails() -> None:
     )
     assert response.response_metadata["stopReason"] == "guardrail_intervened"
     assert response.response_metadata["trace"] is not None
+
+
+def test_structured_output_tool_choice_not_supported() -> None:
+    llm = ChatBedrockConverse(model="us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+    with pytest.warns(None) as record:  # type: ignore[call-overload]
+        structured_llm = llm.with_structured_output(ClassifyQuery)
+        response = structured_llm.invoke("How big are cats?")
+    assert len(record) == 0
+    assert isinstance(response, ClassifyQuery)
+
+    # Unsupported params
+    llm = ChatBedrockConverse(
+        model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        max_tokens=5000,
+        additional_model_request_fields={
+            "thinking": {"type": "enabled", "budget_tokens": 2000}
+        },
+    )
+    with pytest.warns(match="structured output"):
+        structured_llm = llm.with_structured_output(ClassifyQuery)
+    response = structured_llm.invoke("How big are cats?")
+    assert isinstance(response, ClassifyQuery)
+
+    with pytest.raises(OutputParserException):
+        structured_llm.invoke("Hello!")
+
+
+def test_structured_output_thinking_force_tool_use() -> None:
+    # Structured output currently relies on forced tool use, which is not supported
+    # when `thinking` is enabled for Claude 3.7. When this test fails, it means that
+    # the feature is supported and the workarounds in `with_structured_output` should
+    # be removed.
+
+    # Instantiate as convenience for getting client
+    llm = ChatBedrockConverse(model="us.anthropic.claude-3-7-sonnet-20250219-v1:0")
+    messages = [
+        {
+            "role": "user",
+            "content": [{"text": "Generate a username for Sally with green hair"}],
+        }
+    ]
+    params = {
+        "modelId": "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "inferenceConfig": {"maxTokens": 5000},
+        "toolConfig": {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": "ClassifyQuery",
+                        "description": "Classify a query.",
+                        "inputSchema": {
+                            "json": {
+                                "properties": {
+                                    "queryType": {
+                                        "description": (
+                                            "Classify a query as related to cats or "
+                                            "dogs."
+                                        ),
+                                        "enum": ["cat", "dog"],
+                                        "type": "string",
+                                    }
+                                },
+                                "required": ["query_type"],
+                                "type": "object",
+                            }
+                        },
+                    }
+                }
+            ],
+            "toolChoice": {"tool": {"name": "ClassifyQuery"}},
+        },
+        "additionalModelRequestFields": {
+            "thinking": {"type": "enabled", "budget_tokens": 2000}
+        },
+    }
+    with pytest.raises(llm.client.exceptions.ValidationException):
+        response = llm.client.converse(messages=messages, **params)
+
+
+def test_bedrock_pdf_inputs() -> None:
+    model = ChatBedrockConverse(model="anthropic.claude-3-sonnet-20240229-v1:0")
+    url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
+    pdf_data = base64.b64encode(httpx.get(url).content).decode("utf-8")
+
+    message = HumanMessage(
+        [
+            {"type": "text", "text": "Summarize this document:"},
+            {
+                "type": "file",
+                "source_type": "base64",
+                "mime_type": "application/pdf",
+                "data": pdf_data,
+                "name": "my-pdf",  # Converse requires a filename
+            },
+        ]
+    )
+    _ = model.invoke([message])
+
+    # Test OpenAI Chat Completions format
+    message = HumanMessage(
+        [
+            {
+                "type": "text",
+                "text": "Summarize this document:",
+            },
+            {
+                "type": "file",
+                "file": {
+                    "filename": "my-pdf",
+                    "file_data": f"data:application/pdf;base64,{pdf_data}",
+                },
+            },
+        ]
+    )
+    _ = model.invoke([message])
